@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>DiscLogger Binary</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; margin: 20px; background:#fafafa; color:#111; }
+    button { padding: 10px 14px; margin: 4px; border: 1px solid #ccc; border-radius: 8px; background: white; cursor: pointer; }
+    button.primary { background:#111; color:white; }
+    button:disabled { opacity: .45; cursor: not-allowed; }
+    .card { background:white; border:1px solid #ddd; border-radius:12px; padding:14px; margin:12px 0; }
+    .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+    pre { background:#111; color:#0f0; padding:12px; border-radius:8px; overflow:auto; max-height:180px; }
+    canvas { width:100%; max-width:900px; height:260px; border:1px solid #ddd; border-radius:8px; background:white; }
+    #map { width:100%; max-width:900px; height:420px; border:1px solid #ddd; border-radius:8px; overflow:hidden; }
+    .small { color:#666; font-size: 13px; }
+    .ok { color: #086; font-weight: 600; }
+    .bad { color: #a00; font-weight: 600; }
+  </style>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+</head>
+<body>
+  <h1>DiscLogger Binary Webapp</h1>
+
+  <div class="card">
+    <div class="row">
+      <button class="primary" id="connectBtn">BLE verbinden</button>
+      <button id="disconnectBtn" disabled>Trennen</button>
+      <span id="conn" class="bad">nicht verbunden</span>
+    </div>
+    <p class="small">
+      Benutze Chrome/Edge auf Windows oder Android. iPhone/Safari unterstützt Web Bluetooth praktisch nicht zuverlässig.
+    </p>
+  </div>
+
+  <div class="card">
+    <h2>Log</h2>
+    <pre id="log"></pre>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="startBtn" disabled>START</button>
+      <button id="stopBtn" disabled>STOP</button>
+      <button id="statusBtn" disabled>STATUS</button>
+      <button id="dumpBtn" disabled>DUMP Binary</button>
+      <button id="clearBtn" disabled>CLEAR</button>
+      <button id="saveBtn" disabled>CSV speichern</button>
+    </div>
+    <p id="summary">Keine Daten.</p>
+  </div>
+
+  <div class="card">
+    <h2>Analyse</h2>
+    <p class="small">Accel/Gyro sind Magnituden. GPS-Plot ist relative X/Y-Projektion aus Lat/Lon.</p>
+    <h3>Accel magnitude</h3>
+    <canvas id="accelCanvas" width="900" height="260"></canvas>
+    <h3>Gyro magnitude</h3>
+    <canvas id="gyroCanvas" width="900" height="260"></canvas>
+    <h3>GPS Pfad</h3>
+    <div id="map"></div>
+    <p class="small" id="mapInfo">Noch keine GPS-Daten.</p>
+  </div>
+
+
+<script>
+const SERVICE_UUID = '19b10000-e8f2-537e-4f6c-d104768a1214';
+const RX_UUID      = '19b10001-e8f2-537e-4f6c-d104768a1214';
+const TX_UUID      = '19b10002-e8f2-537e-4f6c-d104768a1214';
+
+let device, server, service, rxChar, txChar;
+let imu = [];
+let gps = [];
+let header = null;
+let dumpActive = false;
+
+let map = null;
+let gpsLine = null;
+let gpsStartMarker = null;
+let gpsEndMarker = null;
+
+const logEl = document.getElementById('log');
+const connEl = document.getElementById('conn');
+const summaryEl = document.getElementById('summary');
+
+function log(s) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent += `[${t}] ${s}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setConnected(ok) {
+  connEl.textContent = ok ? 'verbunden' : 'nicht verbunden';
+  connEl.className = ok ? 'ok' : 'bad';
+
+  for (const id of ['disconnectBtn','startBtn','stopBtn','statusBtn','dumpBtn','clearBtn']) {
+    const btn = document.getElementById(id);
+    btn.disabled = !ok;
+  }
+
+  document.getElementById('connectBtn').disabled = ok;
+}
+
+async function connect() {
+  try {
+    log('Suche DiscLogger...');
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ name: 'DiscLogger' }],
+      optionalServices: [SERVICE_UUID]
+    });
+
+    device.addEventListener('gattserverdisconnected', () => {
+      setConnected(false);
+      log('Disconnected');
+    });
+
+    log('Verbinde GATT...');
+    server = await device.gatt.connect();
+
+    log('Hole Service...');
+    service = await server.getPrimaryService(SERVICE_UUID);
+
+    log('Hole RX/TX Characteristics...');
+    rxChar = await service.getCharacteristic(RX_UUID);
+    txChar = await service.getCharacteristic(TX_UUID);
+
+    log('RX properties: write=' + rxChar.properties.write + ', writeWithoutResponse=' + rxChar.properties.writeWithoutResponse);
+    log('TX properties: notify=' + txChar.properties.notify + ', read=' + txChar.properties.read);
+
+    await txChar.startNotifications();
+    txChar.addEventListener('characteristicvaluechanged', onNotify);
+
+    setConnected(true);
+    log('Connected');
+  } catch (err) {
+    setConnected(false);
+    log('CONNECT ERROR: ' + err);
+    console.error(err);
+  }
+}
+
+function disconnect() {
+  if (device && device.gatt.connected) device.gatt.disconnect();
+}
+
+async function sendCommand(cmd) {
+  try {
+    if (!device || !device.gatt || !device.gatt.connected) {
+      log('ERR: nicht verbunden');
+      return;
+    }
+
+    if (!rxChar) {
+      log('ERR: RX characteristic fehlt');
+      return;
+    }
+
+    log('Button: ' + cmd);
+
+    const data = new TextEncoder().encode(cmd + '\n');
+
+    // Wichtig:
+    // writeValue() ist je nach Chrome-Version/Characteristic-Modus unzuverlässig/deprecated.
+    // Deshalb versuchen wir zuerst WithResponse, danach WithoutResponse als Fallback.
+    if (typeof rxChar.writeValueWithResponse === 'function') {
+      await rxChar.writeValueWithResponse(data);
+    } else if (typeof rxChar.writeValueWithoutResponse === 'function') {
+      await rxChar.writeValueWithoutResponse(data);
+    } else {
+      await rxChar.writeValue(data);
+    }
+
+    log('> ' + cmd + ' gesendet');
+  } catch (err) {
+    log('SEND ERROR bei ' + cmd + ': ' + err);
+    console.error(err);
+  }
+}
+
+function readU16(dv, off) { return dv.getUint16(off, true); }
+function readI16(dv, off) { return dv.getInt16(off, true); }
+function readU32(dv, off) { return dv.getUint32(off, true); }
+function readI32(dv, off) { return dv.getInt32(off, true); }
+
+function onNotify(ev) {
+  const dv = ev.target.value;
+  if (!dv || dv.byteLength < 1) return;
+
+  const type = dv.getUint8(0);
+
+  if (type === 0x10) { // Text
+    const bytes = new Uint8Array(dv.buffer, dv.byteOffset + 1, dv.byteLength - 1);
+    const txt = new TextDecoder().decode(bytes).trim();
+    if (txt) log('< ' + txt);
+    return;
+  }
+
+  if (type === 0x01) { // Header
+    parseHeader(dv);
+    return;
+  }
+
+  if (type === 0x02) { // IMU records
+    parseImuPacket(dv);
+    return;
+  }
+
+  if (type === 0x03) { // GPS records
+    parseGpsPacket(dv);
+    return;
+  }
+
+  if (type === 0x04) { // End
+    const imuCount = readU16(dv, 1);
+    const gpsCount = readU16(dv, 3);
+    dumpActive = false;
+    log(`Binary dump end: imu=${imuCount}, gps=${gpsCount}`);
+    finishDump();
+    return;
+  }
+
+  log('Unknown packet type: ' + type);
+}
+
+function parseHeader(dv) {
+  const magic =
+    String.fromCharCode(dv.getUint8(1)) +
+    String.fromCharCode(dv.getUint8(2)) +
+    String.fromCharCode(dv.getUint8(3)) +
+    String.fromCharCode(dv.getUint8(4));
+
+  header = {
+    magic,
+    version: dv.getUint8(5),
+    imuCountExpected: readU16(dv, 6),
+    gpsCountExpected: readU16(dv, 8),
+    temp_c_x100: readI16(dv, 10),
+    recordMs: readU32(dv, 12),
+    imuRecordSize: dv.getUint8(16),
+    gpsRecordSize: dv.getUint8(17)
+  };
+
+  imu = [];
+  gps = [];
+  dumpActive = true;
+  document.getElementById('saveBtn').disabled = true;
+
+  log(`Binary header: ${magic} v${header.version}, imu=${header.imuCountExpected}, gps=${header.gpsCountExpected}, temp=${(header.temp_c_x100/100).toFixed(2)}°C`);
+}
+
+function parseImuPacket(dv) {
+  let off = 1;
+  while (off + 16 <= dv.byteLength) {
+    imu.push({
+      t_ms: readU32(dv, off),
+      ax_mg: readI16(dv, off + 4),
+      ay_mg: readI16(dv, off + 6),
+      az_mg: readI16(dv, off + 8),
+      gx_dps: readI16(dv, off + 10),
+      gy_dps: readI16(dv, off + 12),
+      gz_dps: readI16(dv, off + 14)
+    });
+    off += 16;
+  }
+}
+
+function parseGpsPacket(dv) {
+  let off = 1;
+  while (off + 22 <= dv.byteLength) {
+    gps.push({
+      t_ms: readU32(dv, off),
+      lat_e7: readI32(dv, off + 4),
+      lon_e7: readI32(dv, off + 8),
+      alt_cm: readI32(dv, off + 12),
+      speed_cms: readU16(dv, off + 16),
+      hdop_x100: readU16(dv, off + 18),
+      sats: dv.getUint8(off + 20),
+      fix: dv.getUint8(off + 21)
+    });
+    off += 22;
+  }
+}
+
+function finishDump() {
+  const temp = header ? (header.temp_c_x100 / 100).toFixed(2) : '?';
+  summaryEl.textContent = `IMU: ${imu.length} Samples, GPS: ${gps.length} Samples, Temp: ${temp} °C`;
+  document.getElementById('saveBtn').disabled = false;
+  drawAll();
+}
+
+function makeCsv() {
+  const temp = header ? header.temp_c_x100 : '';
+  const lines = ['TYPE,t_ms,ax_mg,ay_mg,az_mg,gx_dps,gy_dps,gz_dps,lat_e7,lon_e7,alt_cm,speed_cms,hdop_x100,sats,fix,temp_c_x100'];
+
+  for (const s of imu) {
+    lines.push(`I,${s.t_ms},${s.ax_mg},${s.ay_mg},${s.az_mg},${s.gx_dps},${s.gy_dps},${s.gz_dps},,,,,,,,`);
+  }
+
+  for (const g of gps) {
+    lines.push(`G,${g.t_ms},,,,,,,${g.lat_e7},${g.lon_e7},${g.alt_cm},${g.speed_cms},${g.hdop_x100},${g.sats},${g.fix},${temp}`);
+  }
+
+  return lines.join('\n');
+}
+
+function saveCsv() {
+  const csv = makeCsv();
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `disc_logger_${new Date().toISOString().replace(/[:.]/g,'-')}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function drawAll() {
+  drawSeries('accelCanvas', imu.map(s => ({
+    x: s.t_ms,
+    y: Math.sqrt(s.ax_mg*s.ax_mg + s.ay_mg*s.ay_mg + s.az_mg*s.az_mg) / 1000
+  })), 'g');
+
+  drawSeries('gyroCanvas', imu.map(s => ({
+    x: s.t_ms,
+    y: Math.sqrt(s.gx_dps*s.gx_dps + s.gy_dps*s.gy_dps + s.gz_dps*s.gz_dps)
+  })), '°/s');
+
+  drawGps();
+}
+
+function drawSeries(canvasId, data, unit) {
+  const c = document.getElementById(canvasId);
+  const ctx = c.getContext('2d');
+  ctx.clearRect(0,0,c.width,c.height);
+
+  ctx.fillStyle = '#111';
+  ctx.font = '14px system-ui';
+
+  if (!data.length) {
+    ctx.fillText('Keine Daten', 20, 30);
+    return;
+  }
+
+  const minX = data[0].x;
+  const maxX = data[data.length - 1].x || minX + 1;
+  let minY = Math.min(...data.map(p => p.y));
+  let maxY = Math.max(...data.map(p => p.y));
+  if (minY === maxY) { minY -= 1; maxY += 1; }
+
+  const pad = 35;
+  ctx.strokeStyle = '#ddd';
+  ctx.beginPath();
+  ctx.moveTo(pad, pad);
+  ctx.lineTo(pad, c.height - pad);
+  ctx.lineTo(c.width - pad, c.height - pad);
+  ctx.stroke();
+
+  ctx.strokeStyle = '#111';
+  ctx.beginPath();
+
+  data.forEach((p, i) => {
+    const x = pad + (p.x - minX) / (maxX - minX) * (c.width - 2*pad);
+    const y = c.height - pad - (p.y - minY) / (maxY - minY) * (c.height - 2*pad);
+    if (i === 0) ctx.moveTo(x,y);
+    else ctx.lineTo(x,y);
+  });
+
+  ctx.stroke();
+  ctx.fillText(`${minY.toFixed(2)}-${maxY.toFixed(2)} ${unit}`, 45, 24);
+}
+
+
+function ensureMap() {
+  if (map) return;
+
+  map = L.map('map');
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 22,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+
+  map.setView([51.1657, 10.4515], 5); // Deutschland als Startansicht
+}
+
+function drawGps() {
+  ensureMap();
+
+  const info = document.getElementById('mapInfo');
+
+  const valid = gps
+    .filter(g => g.fix > 0 && g.lat_e7 !== 0 && g.lon_e7 !== 0)
+    .map(g => ({
+      t_ms: g.t_ms,
+      lat: g.lat_e7 / 1e7,
+      lon: g.lon_e7 / 1e7,
+      alt_m: g.alt_cm / 100,
+      speed_ms: g.speed_cms / 100,
+      sats: g.sats,
+      hdop: g.hdop_x100 / 100
+    }));
+
+  if (gpsLine) {
+    map.removeLayer(gpsLine);
+    gpsLine = null;
+  }
+  if (gpsStartMarker) {
+    map.removeLayer(gpsStartMarker);
+    gpsStartMarker = null;
+  }
+  if (gpsEndMarker) {
+    map.removeLayer(gpsEndMarker);
+    gpsEndMarker = null;
+  }
+
+  if (valid.length < 2) {
+    info.textContent = 'Zu wenig GPS-Daten mit Fix für eine Verlaufslinie.';
+    return;
+  }
+
+  const latlngs = valid.map(p => [p.lat, p.lon]);
+
+  gpsLine = L.polyline(latlngs, {
+    weight: 4
+  }).addTo(map);
+
+  gpsStartMarker = L.marker(latlngs[0]).addTo(map).bindPopup('Start');
+  gpsEndMarker = L.marker(latlngs[latlngs.length - 1]).addTo(map).bindPopup('Ende');
+
+  map.fitBounds(gpsLine.getBounds(), { padding: [30, 30] });
+
+  const distance = pathDistanceMeters(valid);
+  const duration = (valid[valid.length - 1].t_ms - valid[0].t_ms) / 1000;
+  const maxSpeed = Math.max(...valid.map(p => p.speed_ms));
+
+  info.textContent =
+    `GPS Punkte: ${valid.length}, Distanz grob: ${distance.toFixed(1)} m, ` +
+    `Dauer: ${duration.toFixed(2)} s, Max GNSS-Speed: ${maxSpeed.toFixed(2)} m/s`;
+}
+
+function pathDistanceMeters(points) {
+  let total = 0;
+
+  for (let i = 1; i < points.length; i++) {
+    total += haversineMeters(points[i - 1].lat, points[i - 1].lon, points[i].lat, points[i].lon);
+  }
+
+  return total;
+}
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon / 2) ** 2;
+
+  return 2 * R * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+document.getElementById('connectBtn').onclick = () => connect();
+document.getElementById('disconnectBtn').onclick = () => disconnect();
+document.getElementById('startBtn').onclick = () => sendCommand('START');
+document.getElementById('stopBtn').onclick = () => sendCommand('STOP');
+document.getElementById('statusBtn').onclick = () => sendCommand('STATUS');
+document.getElementById('dumpBtn').onclick = () => sendCommand('DUMP');
+document.getElementById('clearBtn').onclick = () => sendCommand('CLEAR');
+document.getElementById('saveBtn').onclick = () => saveCsv();
+
+setConnected(false);
+</script>
+</body>
+</html>
