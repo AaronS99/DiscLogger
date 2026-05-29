@@ -107,8 +107,9 @@ async function connect() {
   try {
     log('Suche DiscLogger...');
     device = await navigator.bluetooth.requestDevice({
-      filters: [{ name: 'DiscLogger' }],
-      optionalServices: [SERVICE_UUID]
+      // filters: [{ name: 'DiscLogger' }],
+      // optionalServices: [SERVICE_UUID]
+      acceptAllDevices: true
     });
 
     device.addEventListener('gattserverdisconnected', () => {
