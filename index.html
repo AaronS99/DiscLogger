@@ -18,11 +18,16 @@
     .small { color:#666; font-size: 13px; }
     .ok { color: #086; font-weight: 600; }
     .bad { color: #a00; font-weight: 600; }
+    .metric { min-width: 120px; border:1px solid #ddd; border-radius:10px; padding:10px; background:#fafafa; }
+    .metric b { display:block; font-size:12px; color:#666; margin-bottom:4px; }
+    .metric span { font-size:18px; font-weight:700; }
+    #timeSlider { width: 100%; height: 42px; touch-action: manipulation; }
   </style>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 </head>
 <body>
   <h1>DiscLogger Binary Webapp</h1>
+  <p class="small"><b>Stable rollback:</b> v23 parser + acceptAllDevices only.</p>
 
   <div class="card">
     <div class="row">
@@ -54,7 +59,28 @@
 
   <div class="card">
     <h2>Analyse</h2>
-    <p class="small">Accel/Gyro sind Magnituden. GPS-Plot ist relative X/Y-Projektion aus Lat/Lon.</p>
+    <p class="small">Accel/Gyro sind Magnituden. RPM ist aus Gyro-Magnitude geschätzt.</p>
+
+    <div class="card" style="margin:12px 0;">
+      <h3>Timeline</h3>
+      <input id="timeSlider" type="range" min="0" max="20000" value="0" step="10">
+      <div class="row" style="margin-top:8px;">
+        <button id="timeline0Btn" type="button">0s</button>
+        <button id="timelineMidBtn" type="button">Mitte</button>
+        <button id="timelineEndBtn" type="button">Ende</button>
+        <button id="timelineRefreshBtn" type="button">Timeline aktualisieren</button>
+      </div>
+      <p id="timelineDebug" class="small">Timeline wartet auf Daten.</p>
+    </div>
+
+    <div class="row" id="metricCards">
+      <div class="metric"><b>Zeit</b><span id="mTime">–</span></div>
+      <div class="metric"><b>Distanz</b><span id="mDistance">–</span></div>
+      <div class="metric"><b>GPS-Speed</b><span id="mSpeed">–</span></div>
+      <div class="metric"><b>RPM est.</b><span id="mRpm">–</span></div>
+      <div class="metric"><b>Accel</b><span id="mAccel">–</span></div>
+      <div class="metric"><b>Gyro</b><span id="mGyro">–</span></div>
+    </div>
     <h3>Accel magnitude</h3>
     <canvas id="accelCanvas" width="900" height="260"></canvas>
     <h3>Gyro magnitude</h3>
@@ -80,6 +106,10 @@ let map = null;
 let gpsLine = null;
 let gpsStartMarker = null;
 let gpsEndMarker = null;
+let gpsCurrentMarker = null;
+let timelineDistanceSeries = [];
+let timelineMaxMs = 20000;
+let timelineLastKey = '';
 
 const logEl = document.getElementById('log');
 const connEl = document.getElementById('conn');
@@ -100,16 +130,197 @@ function setConnected(ok) {
     btn.disabled = !ok;
   }
 
-  document.getElementById('connectBtn').disabled = ok;
+  
+// ------------------------------------------------------------
+// Timeline Dashboard
+// ------------------------------------------------------------
+// Wichtig: Dieser Block greift direkt auf die globalen Arrays `imu` und `gps` zu,
+// also auf dieselben Daten, aus denen die funktionierenden Charts entstehen.
+// Er ist absichtlich unabhängig von finishDump(), damit er auch dann läuft,
+// wenn sich der Dump-Abschluss je nach Browser etwas anders verhält.
+
+function tlSet(id, value) {
+  const el = document.getElementById(id);
+  if (el) el.textContent = value;
+}
+
+function tlDebug(msg) {
+  const el = document.getElementById('timelineDebug');
+  if (el) el.textContent = msg;
+}
+
+function tlNearest(arr, t) {
+  if (!arr || arr.length === 0) return null;
+
+  let best = arr[0];
+  let bestDiff = Math.abs(Number(arr[0].t_ms || 0) - t);
+
+  for (let i = 1; i < arr.length; i++) {
+    const diff = Math.abs(Number(arr[i].t_ms || 0) - t);
+    if (diff < bestDiff) {
+      best = arr[i];
+      bestDiff = diff;
+    }
+  }
+
+  return best;
+}
+
+function tlBuildDistanceSeries() {
+  const valid = gps
+    .filter(g => Number(g.fix) > 0 && Number(g.lat_e7) !== 0 && Number(g.lon_e7) !== 0)
+    .map(g => ({
+      t_ms: Number(g.t_ms),
+      lat: Number(g.lat_e7) / 1e7,
+      lon: Number(g.lon_e7) / 1e7,
+      speed_ms: Number(g.speed_cms) / 100
+    }))
+    .sort((a, b) => a.t_ms - b.t_ms);
+
+  timelineDistanceSeries = [];
+
+  let dist = 0;
+
+  for (let i = 0; i < valid.length; i++) {
+    if (i > 0) {
+      dist += haversineMeters(valid[i - 1].lat, valid[i - 1].lon, valid[i].lat, valid[i].lon);
+    }
+
+    timelineDistanceSeries.push({
+      ...valid[i],
+      distance_m: dist
+    });
+  }
+}
+
+function tlInit() {
+  const slider = document.getElementById('timeSlider');
+  if (!slider) {
+    log('TIMELINE ERROR: Slider DOM fehlt');
+    return;
+  }
+
+  let maxT = 0;
+
+  for (const s of imu) {
+    const t = Number(s.t_ms);
+    if (Number.isFinite(t) && t > maxT) maxT = t;
+  }
+
+  for (const g of gps) {
+    const t = Number(g.t_ms);
+    if (Number.isFinite(t) && t > maxT) maxT = t;
+  }
+
+  if (!maxT || maxT < 10) {
+    maxT = 20000; // Fallback, aber Datenanzeige versucht trotzdem nearest sample
+  }
+
+  timelineMaxMs = Math.round(maxT);
+
+  tlBuildDistanceSeries();
+
+  slider.disabled = false;
+  slider.min = '0';
+  slider.max = String(timelineMaxMs);
+  slider.step = '10';
+
+  // Wert beibehalten, falls möglich.
+  const oldValue = Number(slider.value || 0);
+  slider.value = String(Math.max(0, Math.min(timelineMaxMs, oldValue)));
+
+  slider.oninput = () => tlRender(Number(slider.value));
+  slider.onchange = () => tlRender(Number(slider.value));
+
+  tlDebug(`Timeline bereit: IMU=${imu.length}, GPS=${gps.length}, max=${timelineMaxMs}ms`);
+  log(`Timeline bereit: IMU=${imu.length}, GPS=${gps.length}, max=${timelineMaxMs}ms`);
+
+  tlRender(Number(slider.value || 0));
+}
+
+function tlRender(t) {
+  t = Number(t);
+  if (!Number.isFinite(t)) t = 0;
+
+  tlSet('mTime', (t / 1000).toFixed(2) + ' s');
+
+  const imuSample = tlNearest(imu, t);
+  const gpsValid = gps.filter(g => Number(g.fix) > 0 && Number(g.lat_e7) !== 0 && Number(g.lon_e7) !== 0);
+  const gpsSample = tlNearest(gpsValid, t);
+  const distSample = tlNearest(timelineDistanceSeries, t);
+
+  if (imuSample) {
+    const ax = Number(imuSample.ax_mg);
+    const ay = Number(imuSample.ay_mg);
+    const az = Number(imuSample.az_mg);
+    const gx = Number(imuSample.gx_dps);
+    const gy = Number(imuSample.gy_dps);
+    const gz = Number(imuSample.gz_dps);
+
+    const accel = Math.sqrt(ax*ax + ay*ay + az*az) / 1000;
+    const gyro = Math.sqrt(gx*gx + gy*gy + gz*gz);
+    const rpm = gyro / 360 * 60;
+
+    tlSet('mAccel', accel.toFixed(2) + ' g');
+    tlSet('mGyro', gyro.toFixed(0) + ' °/s');
+    tlSet('mRpm', rpm.toFixed(0));
+  } else {
+    tlSet('mAccel', 'keine IMU');
+    tlSet('mGyro', 'keine IMU');
+    tlSet('mRpm', 'keine IMU');
+  }
+
+  if (gpsSample) {
+    tlSet('mSpeed', (Number(gpsSample.speed_cms) / 100).toFixed(2) + ' m/s');
+
+    const lat = Number(gpsSample.lat_e7) / 1e7;
+    const lon = Number(gpsSample.lon_e7) / 1e7;
+    tlMapMarker(lat, lon);
+  } else {
+    tlSet('mSpeed', 'keine GPS');
+  }
+
+  if (distSample) {
+    tlSet('mDistance', Number(distSample.distance_m).toFixed(1) + ' m');
+  } else {
+    tlSet('mDistance', 'keine GPS');
+  }
+
+  tlDebug(`t=${Math.round(t)}ms | IMU=${imu.length} | GPS=${gps.length} | imuSample=${imuSample ? imuSample.t_ms : 'none'} | gpsSample=${gpsSample ? gpsSample.t_ms : 'none'}`);
+}
+
+function tlMapMarker(lat, lon) {
+  if (!map || typeof L === 'undefined') return;
+
+  if (gpsCurrentMarker) {
+    gpsCurrentMarker.setLatLng([lat, lon]);
+  } else {
+    gpsCurrentMarker = L.circleMarker([lat, lon], {
+      radius: 8,
+      weight: 3,
+      fillOpacity: 0.85
+    }).addTo(map).bindPopup('Timeline-Position');
+  }
+}
+
+// Auto-Init: erkennt neue Dump-Daten auch dann, wenn finishDump-Hook nicht greift.
+setInterval(() => {
+  const key = `${imu.length}:${gps.length}`;
+  if (key !== timelineLastKey && (imu.length > 0 || gps.length > 0)) {
+    timelineLastKey = key;
+    tlInit();
+  }
+}, 500);
+
+document.getElementById('connectBtn').disabled = ok;
 }
 
 async function connect() {
   try {
     log('Suche DiscLogger...');
     device = await navigator.bluetooth.requestDevice({
-      // filters: [{ name: 'DiscLogger' }],
-      // optionalServices: [SERVICE_UUID]
-      acceptAllDevices: true
+      acceptAllDevices: true,
+      optionalServices: [SERVICE_UUID]
     });
 
     device.addEventListener('gattserverdisconnected', () => {
@@ -413,6 +624,10 @@ function drawGps() {
   if (gpsEndMarker) {
     map.removeLayer(gpsEndMarker);
     gpsEndMarker = null;
+  }
+  if (gpsCurrentMarker) {
+    map.removeLayer(gpsCurrentMarker);
+    gpsCurrentMarker = null;
   }
 
   if (valid.length < 2) {
